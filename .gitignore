@@ -1,0 +1,6 @@
+bin/*
+!bin/mlfman
+!bin/scripts
+components/*/images/
+components/*/charts/*.tgz
+components/kubeflow/manifests/

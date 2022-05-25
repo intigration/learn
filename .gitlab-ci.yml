@@ -1,0 +1,26 @@
+default:
+  tags: [DOCKER]
+
+stages:
+  - build
+
+variables:
+  http_proxy: "$CODE_PROXY"
+  https_proxy: "$CODE_PROXY"
+  no_proxy: "127.0.0.1,localhost,.siemens.de,.siemens.net,.siemens.com,.siemens.io,s3.dualstack.eu-central-1.amazonaws.com"
+
+build:
+  stage: build
+  image: alpine:latest
+  variables:
+      PACKAGE_COMPRESS: xz
+      PACKAGE_COMPRESS_LEVEL: 9
+  script:
+    - ./build.sh -vv --pack
+    - mv "./installer" "./MLFM_Installer_${CI_COMMIT_TAG:-${CI_PIPELINE_IID}}.run"
+  artifacts:
+    paths:
+      - ./MLFM_Installer_*.run
+  only:
+    - master
+    - tags

@@ -1,0 +1,15 @@
+kfName: ml-pipeline-ui.kubeflow
+kfPort: 80
+
+fe:
+  enabled: true
+  pipelineRouteSubpath: "api/pips/v1"
+  mgmtRouteSubpath: "api/mgmt/v1"
+
+  ingress:
+    enabled: true
+    hostname: mlfm.siemens.local
+
+cringress:
+  enabled: true
+  hostname: cr.mlfm.siemens.local

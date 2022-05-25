@@ -1,0 +1,279 @@
+#!/bin/sh
+
+set -e
+
+trap '
+[ $? -eq 0 ] || {
+  case "$OP" in
+    start) fatal "Starting failed!";;
+    uninstall) fatal "Uninstalling failed";;
+  esac
+}
+' EXIT
+
+VERSION="3.0.0"
+
+: "${MLFM_HOME:="$HOME/.mlfm"}"
+
+. "$MLFM_HOME/.env"
+
+: "${CLUSTER_NAME:="default"}"
+: "${NAMESPACE:="mlfm"}"
+: "${EMBEDDED_K3S:=1}"
+: "${DOCKER:=0}"
+: "${INGRESS:=1}"
+: "${TIMEOUT:="15m"}"
+
+BINDIR="bin"
+MANDIR="manifests"
+CHARTDIR="charts"
+
+MLFM_HOST="mlfm.siemens.local"
+MLFM_CR_HOST="cr.mlfm.siemens.local"
+REGMIRROR="mlfm-cr.mlfm:80"
+REGCONFIG="$MLFM_HOME/.registries.yaml"
+
+[ $EMBEDDED_K3S -eq 0 ] && {
+  export KUBECONFIG
+} || {
+  export KUBECONFIG="$MLFM_HOME/.kube/config"
+}
+
+# A little bit of cheating
+[ ${EUID:-$(id -u)} -eq 0 ] && SUDO="" || SUDO="$(command -v sudo)"
+SYSTEMCTL="$(command -v systemctl || true)"
+
+########## Util ##########
+
+get_service_ip() {
+  KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" get svc "$1" \
+    -n "$2" \
+    -o jsonpath="{.spec.clusterIP}"
+}
+
+##########################
+
+_ensure_cr() {
+  log "Ensuring MLFM CR is properly configured"
+
+  touch "$REGCONFIG" \
+    && "$YQBIN" -i '{"mirrors": {"'"$REGMIRROR"'": {"endpoint": ["http://'"$MLFM_CR_HOST"'"]}}}' "$REGCONFIG"
+  ensure_fqdn "127.0.0.1" "$MLFM_CR_HOST" "MLFM Container Registry"
+}
+
+_ensure_k3s_systemd() {
+  if [ ! -f "/etc/systemd/system/k3s.service" ]; then (
+    export INSTALL_K3S_BIN_DIR="$BINDIR"
+    export INSTALL_K3S_EXEC="$INSTALL_K3S_EXEC --private-registry $REGCONFIG"
+    export INSTALL_K3S_SKIP_DOWNLOAD=true
+    export INSTALL_K3S_SKIP_START=true
+    export PATH="$BINDIR:$OPATH"
+    "$BINDIR/k3s-install.sh" "$@"
+  ) fi
+  $SUDO "$SYSTEMCTL" restart k3s
+}
+
+_ensure_kubeconfig() {
+  [ $EMBEDDED_K3S -eq 0 ] && [ -O "$KUBECONFIG" ]|| {
+    $SUDO mkdir -p "$(dirname $KUBECONFIG)"
+    $SUDO cp "/etc/rancher/k3s/k3s.yaml" "$KUBECONFIG"
+    $SUDO chown -R "$USER:$USER" "$(dirname $KUBECONFIG)"
+  }
+}
+
+# TODO: Improve external k8s support
+_ensure_k3s() {(
+  log "Ensuring K3S is up"
+
+  [ $EMBEDDED_K3S -eq 0 ] && {
+    local _KUBECONFIG="$KUBECONFIG"
+  } || {
+    local _KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+  }
+
+  local K8S_SERVER="$(
+    $SUDO KUBECONFIG="$_KUBECONFIG" "$KUBECTLBIN" config view \
+      -o jsonpath='{.clusters[?(@.name == "'"$CLUSTER_NAME"'")].cluster.server}' 2>/dev/null
+  )"
+
+  K8S_ADDR_PORT="${K8S_SERVER#*//}"
+  K8S_ADDR="${K8S_ADDR_PORT%%:*}"
+  K8S_PORT="${K8S_ADDR_PORT#*:}"
+
+  [ "x$K8S_SERVER" != "x" ] && nc -z "$K8S_ADDR" "$K8S_PORT" && logv "K3S API server is up" || {
+    if [ "x$SYSTEMCTL" != "x" ]; then
+      _ensure_k3s_systemd 2>&1 | logv
+    else
+      fatal "Baremetal installation is not supported"
+      # _ensure_k3s_baremetal 2>&1 | logv
+    fi
+
+    _ensure_kubeconfig
+
+    K8S_SERVER="$(
+      KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" config view \
+        -o jsonpath='{.clusters[?(@.name == "'"$CLUSTER_NAME"'")].cluster.server}'
+    )"
+
+    [ "x$K8S_SERVER" != "x" ] || fatal "Couldn't reach the cluster"
+    K8S_ADDR_PORT="${K8S_SERVER#*//}"
+    K8S_ADDR="${K8S_ADDR_PORT%%:*}"
+    K8S_PORT="${K8S_ADDR_PORT#*:}"
+
+    wait_on_port "$K8S_ADDR" "$K8S_PORT" 1 30 \
+      && logv "K3S API server is up" \
+      || fatal "Giving up waiting for K3S API server"
+  }
+
+  _ensure_kubeconfig
+
+  timeout 300 sh << EOF && logv "K3S node is up" || fatal "Giving up waiting for K3S node"
+until KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" wait --for=condition=ready node --all >/dev/null 2>&1
+do
+  sleep 1
+done
+EOF
+)}
+
+_ensure_namespace() {
+  KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" create ns "$1" 2>&1 | logvv || true
+}
+
+_ensure_kubeflow() {
+  log "Ensuring kubeflow is up"
+
+  [ "x$DEPLOY_KEY_USERNAME" != "x" ] || fatal "Need to specify DEPLOY_KEY_USERNAME"
+  [ "x$DEPLOY_KEY_PASSWORD" != "x" ] || fatal "Need to specify DEPLOY_KEY_PASSWORD"
+
+  KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" apply \
+    -k "$KFMANDIR/cluster-scoped-resources" 2>&1 | logv
+
+  KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" wait \
+    --for=condition=established \
+    --timeout=60s \
+    crd/applications.app.k8s.io 2>&1 | logv
+
+  KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" apply \
+  -k "$KFMANDIR/env/platform-agnostic-emissary" 2>&1 | logv
+}
+
+_ensure_mlfm() {
+  log "Ensuring MLFM is up"
+  _ensure_namespace "$NAMESPACE"
+  _ensure_kubeflow
+
+  KUBECONFIG="$KUBECONFIG" "$HELMBIN" list -Aq \
+    | grep -q mlfm && logv "Found MLFM" || {
+      logv "Installing MLFM"
+
+      KUBECONFIG="$KUBECONFIG" "$HELMBIN" install \
+        mlfm "$MLFMCHARTDIR/mlfm.tgz" \
+          -n "$NAMESPACE" \
+          --timeout "$TIMEOUT" \
+          --set="auth.imagePullUsername=$DEPLOY_KEY_USERNAME,auth.imagePullPassword=$DEPLOY_KEY_PASSWORD" \
+          -f "$MLFMCHARTDIR/mlfm.values.yaml" 2>&1 | logvv
+      KUBECONFIG="$KUBECONFIG" "$HELMBIN" list -Aq \
+        | grep -q mlfm \
+          && logv "Installed MLFM" \
+          || fatal "Installing MLFM failed"
+    }
+
+    ensure_fqdn "127.0.0.1" "$MLFM_HOST" "MLFM"
+}
+
+start() {
+  _ensure_cr
+  _ensure_k3s
+  _ensure_mlfm
+
+  [ $INGRESS -eq 0 ] \
+    && MLFM_ENDPOINT="$(get_service_ip "mlfm-ui" "$NAMESPACE")" \
+    || MLFM_ENDPOINT="$MLFM_HOST"
+
+  cat << EOF | log
+Waiting for pods to be ready.
+To monitor the pods status, open a terminal and run
+  watch mlfman kubectl get po -n $NAMESPACE
+When MLFM is up (should take about 10-15mins)
+  open http://$MLFM_ENDPOINT in your browser.
+EOF
+}
+
+uninstall() {
+  [ $EMBEDDED_K3S -eq 0 ] || {
+    log "Removing K3S"
+    PATH="$BINDIR:$OPATH" "$BINDIR/k3s-uninstall.sh" 2>&1 | logv
+    # TODO: Handle baremetal removal
+  }
+
+  log "Removing MLFM"
+  logv "Removing mlfman symlink"
+  $SUDO rm -f /usr/local/bin/mlfman
+  logv "Removing MLFM components"
+  $SUDO rm -rf "$COMPDIR"
+  logv "Removing MLFM root"
+  $SUDO rm -rf "$MLFM_HOME"
+
+  # TODO: Revert /etc/hosts changes
+}
+
+usage() {
+  echo "Usage: mlfman [command]"
+  echo
+  echo "Manage MLFM installation"
+  echo
+  echo "  mlfman help           - show usage and help"
+  echo "  mlfman start          - start MLFM master/node"
+  echo "  mlfman kubectl        - run kubectl"
+  echo "  mlfman crictl         - run crictl"
+  echo "  mlfman ctr            - run ctr"
+  echo "  mlfman helm           - run helm"
+  echo "  mlfman crane          - run crane"
+  echo "  mlfman uninstall      - uninstall MLFM"
+  echo "  mlfman version        - print mlfman version"
+  echo
+}
+
+setup() {
+  MLFM_HOME="$1"
+
+  BINDIR="$1/bin"
+  COMPDIR="$1/components"
+
+  KFDIR="$COMPDIR/kubeflow"
+  KFMANDIR="$KFDIR/manifests"
+
+  MLFMDIR="$COMPDIR/mlfm"
+  MLFMCHARTDIR="$MLFMDIR/charts"
+
+  OPATH="$PATH"
+  export PATH="$BINDIR"
+
+  . "$BINDIR/scripts/util.sh"
+
+  K3SBIN="$BINDIR/k3s"
+  KUBECTLBIN="$BINDIR/kubectl"
+  HELMBIN="$BINDIR/helm"
+  CRANEBIN="$BINDIR/crane"
+  YQBIN="$BINDIR/yq"
+}
+
+main() {
+  setup "$1"; shift
+
+  OP="$1"
+  case "$1" in
+    help) usage;;
+    start) shift; start "$@";;
+    kubectl) shift; KUBECONFIG="$KUBECONFIG" "$KUBECTLBIN" "$@";;
+    crictl) shift; $SUDO "$K3SBIN" crictl "$@";;
+    ctr) shift; $SUDO "$K3SBIN" ctr "$@";;
+    helm) shift; KUBECONFIG="$KUBECONFIG" "$HELMBIN" "$@";;
+    crane) shift; "$CRANEBIN" "$@";;
+    uninstall) shift; uninstall "$@";;
+    version) echo "$VERSION";;
+    *) usage >&2; return 1;;
+  esac
+}
+
+main "$MLFM_HOME" "$@"
